@@ -54,7 +54,7 @@ def detect_hp_col(df):
             return c
     return None
 
-def apply_filters(df, markets=None, countries=None, months=None, priorities=None, business_groups=None):
+def apply_filters(df, markets=None, countries=None, months=None, priorities=None, business_groups=None, statuses=None):
     mask = pd.Series(True, index=df.index)
     if markets:
         mask &= df['market'].isin(markets)
@@ -67,6 +67,9 @@ def apply_filters(df, markets=None, countries=None, months=None, priorities=None
     if business_groups:
         if 'business_group' in df.columns:
             mask &= df['business_group'].isin(business_groups)
+    if statuses:
+        if 'status' in df.columns:
+            mask &= df['status'].isin(statuses)
     return df.loc[mask].copy()
 
 def df_to_bytes(df):
@@ -107,6 +110,13 @@ sel_months = st.sidebar.multiselect('Month (YYYY-MM)', options=month_opts, defau
 sel_priorities = st.sidebar.multiselect('Priority', options=priority_opts, default=None)
 sel_business = st.sidebar.multiselect('Business Group', options=business_opts, default=None)
 
+if 'status' in df.columns:
+    status_opts = sorted(df['status'].dropna().unique().tolist())
+else:
+    status_opts = []
+
+sel_status = st.sidebar.multiselect('Status', options=status_opts, default=None)
+
 st.sidebar.markdown('---')
 st.sidebar.write('Data rows: %s' % f"{len(df):,}")
 
@@ -116,14 +126,15 @@ f_countries = sel_countries if sel_countries else None
 f_months = sel_months if sel_months else None
 f_priorities = sel_priorities if sel_priorities else None
 f_business = sel_business if sel_business else None
+f_status = sel_status if sel_status else None
 
-filtered = apply_filters(df, markets=f_markets, countries=f_countries, months=f_months, priorities=f_priorities, business_groups=f_business)
+filtered = apply_filters(df, markets=f_markets, countries=f_countries, months=f_months, priorities=f_priorities, business_groups=f_business, statuses=f_status)
 
 st.title('Lead Conversion: Urgent vs Normal')
 st.markdown('Interactive Streamlit dashboard: compare conversion between Urgent and Normal priorities. Use the sidebar filters to slice the data.')
 
 # --- Main KPIs and priority comparison ---
-col1, col2, col3 = st.columns([1,1,1])
+col1, col2, col3, col4 = st.columns([1,1,1,1])
 with col1:
     if hp_col:
         total = int(filtered[hp_col].sum())
@@ -139,6 +150,12 @@ with col2:
 with col3:
     conv_pct = (qualified / total * 100) if total else 0
     st.metric('Conversion %', f'{conv_pct:.1f}%')
+with col4:
+    if 'tov' in filtered.columns and pd.api.types.is_numeric_dtype(filtered['tov']):
+        avg_tov = filtered['tov'].mean()
+        st.metric('Average TOV', f'{avg_tov:.2f}')
+    else:
+        st.metric('Average TOV', 'N/A')
 
 st.markdown('### Conversion % by Priority')
 if not filtered.empty:
@@ -165,9 +182,9 @@ st.markdown('### Qualified vs Other (stacked) by Priority')
 if not filtered.empty:
     agg['other_leads'] = agg['total_leads'] - agg['qualified_leads']
     fig2 = go.Figure()
-    fig2.add_trace(go.Bar(name='Qualified', x=agg.index, y=agg['qualified_leads']))
-    fig2.add_trace(go.Bar(name='Other', x=agg.index, y=agg['other_leads']))
-    fig2.update_layout(barmode='stack', title='Qualified vs Other by Priority', height=400)
+    fig2.add_trace(go.Bar(name='Qualified', x=agg.index, y=agg['qualified_leads'], marker_color='green'))
+    fig2.add_trace(go.Bar(name='Other', x=agg.index, y=agg['other_leads'], marker_color='lightgray'))
+    fig2.update_layout(barmode='stack', title='Qualified vs Other by Priority', height=400, legend=dict(title='Segment'))
     st.plotly_chart(fig2, use_container_width=True)
 
 st.markdown('### Conversion % Over Time')
@@ -188,6 +205,30 @@ if 'yyyymm' in filtered.columns and not filtered.empty:
     st.plotly_chart(fig_ts, use_container_width=True)
 else:
     st.info('No yyyymm column or no data for time series.')
+
+st.markdown('### Average TOV Analysis')
+if 'tov' in filtered.columns and pd.api.types.is_numeric_dtype(filtered['tov']):
+    avg_tov_overall = filtered['tov'].mean()
+    st.write(f"Average TOV (overall): {avg_tov_overall:.2f}")
+
+    # TOV by priority
+    tov_by_pr = filtered.groupby('_priority_norm')['tov'].mean().reindex(['Urgent','Normal']).fillna(0)
+    fig_tov_pr = px.bar(tov_by_pr.reset_index(), x='_priority_norm', y='tov', labels={'_priority_norm':'Priority','tov':'Average TOV'}, text=tov_by_pr.map(lambda v: f"{v:.2f}"))
+    fig_tov_pr.update_layout(title='Average TOV by Priority', height=350)
+    st.plotly_chart(fig_tov_pr, use_container_width=True)
+
+    # TOV over time by priority
+    if 'yyyymm' in filtered.columns:
+        tov_ts = filtered.groupby(['yyyymm','_priority_norm'])['tov'].mean().reset_index()
+        pivot_tov = tov_ts.pivot(index='yyyymm', columns='_priority_norm', values='tov').fillna(0).reset_index().sort_values('yyyymm')
+        fig_tov_ts = go.Figure()
+        for pr in ['Urgent','Normal']:
+            if pr in pivot_tov.columns:
+                fig_tov_ts.add_trace(go.Scatter(x=pivot_tov['yyyymm'], y=pivot_tov[pr], mode='lines+markers', name=pr))
+        fig_tov_ts.update_layout(title='Average TOV Over Time', xaxis_title='Month (YYYY-MM)', yaxis_title='Average TOV', height=400)
+        st.plotly_chart(fig_tov_ts, use_container_width=True)
+else:
+    st.info('TOV column not available or not numeric.')
 
 st.markdown('### Filtered sample (first 200 rows)')
 st.dataframe(filtered.head(200))
