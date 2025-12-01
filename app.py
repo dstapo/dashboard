@@ -87,6 +87,9 @@ except FileNotFoundError as e:
 
 df = prepare(df)
 hp_col = detect_hp_col(df)
+# Remove Greater China from the dataset entirely so it doesn't appear in filters or charts
+if 'market' in df.columns:
+    df = df.loc[df['market'].astype(str).str.strip().str.lower() != 'greater china'].copy()
 
 # Sidebar filters
 st.sidebar.header('Filters')
@@ -137,13 +140,13 @@ st.markdown('Interactive Streamlit dashboard: compare conversion between Urgent 
 col1, col2, col3, col4 = st.columns([1,1,1,1])
 with col1:
     if hp_col:
-        total = int(filtered[hp_col].sum())
+        total = int(round(filtered[hp_col].sum()))
     else:
         total = int(len(filtered))
     st.metric('Total leads', f'{total:,}')
 with col2:
     if hp_col:
-        qualified = int(filtered.loc[filtered['_is_qualified'], hp_col].sum())
+        qualified = int(round(filtered.loc[filtered['_is_qualified'], hp_col].sum()))
     else:
         qualified = int(filtered['_is_qualified'].sum())
     st.metric('Qualified', f'{qualified:,}')
@@ -153,7 +156,8 @@ with col3:
 with col4:
     if 'tov' in filtered.columns and pd.api.types.is_numeric_dtype(filtered['tov']):
         avg_tov = filtered['tov'].mean()
-        st.metric('Average TOV', f'{avg_tov:.2f}')
+        # show monetary-like integer without decimals
+        st.metric('Average TOV', f"{int(round(avg_tov)):,}")
     else:
         st.metric('Average TOV', 'N/A')
 
@@ -171,21 +175,97 @@ if not filtered.empty:
         if p not in agg.index:
             agg.loc[p] = {'total_leads':0,'qualified_leads':0,'conversion_pct':0}
     agg = agg.loc[['Urgent','Normal']]
-    fig = px.bar(agg.reset_index(), x='_priority_norm', y='conversion_pct', text=agg['conversion_pct'].fillna(0).map(lambda v: f"{v:.1f}%"),
-                 labels={'_priority_norm':'Priority','conversion_pct':'Conversion %'}, height=400)
-    fig.update_layout(yaxis=dict(range=[0, max(10, (agg['conversion_pct'].max() or 0)*1.15)]))
+    fig = px.bar(agg.reset_index(), x='_priority_norm', y='conversion_pct',
+                 text=agg['conversion_pct'].fillna(0).map(lambda v: f"{v:.1f}%"),
+                 labels={'_priority_norm':'Priority','conversion_pct':'Conversion %'}, height=460)
+    # configure text inside bars for percentages
+    fig.update_traces(textposition='inside')
+    # compute y-axis max
+    y_max = max(10, (agg['conversion_pct'].max() or 0) * 1.3)
+    fig.update_layout(yaxis=dict(range=[0, y_max]))
+    # add two-line annotations (Qualified / Total) inside each bar for clearer absolute numbers
+    df_agg = agg.reset_index()
+    for _, row in df_agg.iterrows():
+        pr = row['_priority_norm']
+        conv = row['conversion_pct'] if pd.notna(row['conversion_pct']) else 0
+        qualified_val = int(row['qualified_leads']) if pd.notna(row['qualified_leads']) else 0
+        total_val = int(row['total_leads']) if pd.notna(row['total_leads']) else 0
+        # place annotation roughly at half the bar height
+        y_pos = conv * 0.5
+        ann_text = f"Q: {qualified_val:,}<br>Total: {total_val:,}"
+        fig.add_annotation(x=pr, y=y_pos,
+                           text=ann_text, showarrow=False,
+                           font=dict(size=11, color='white'), align='center',
+                           bgcolor='rgba(0,0,0,0.35)', bordercolor='rgba(0,0,0,0.1)')
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.info('No data available for selected filters.')
 
-st.markdown('### Qualified vs Other (stacked) by Priority')
+st.markdown('### Qualified / Open / Disqualified by Priority (stacked)')
 if not filtered.empty:
-    agg['other_leads'] = agg['total_leads'] - agg['qualified_leads']
-    fig2 = go.Figure()
-    fig2.add_trace(go.Bar(name='Qualified', x=agg.index, y=agg['qualified_leads'], marker_color='green'))
-    fig2.add_trace(go.Bar(name='Other', x=agg.index, y=agg['other_leads'], marker_color='lightgray'))
-    fig2.update_layout(barmode='stack', title='Qualified vs Other by Priority', height=400, legend=dict(title='Segment'))
-    st.plotly_chart(fig2, use_container_width=True)
+    # If we have a status column, split non-qualified rows into Open and Disqualified where possible
+    if 'status' in filtered.columns:
+        def map_segment(row):
+            if row.get('_is_qualified'):
+                return 'Qualified'
+            s = str(row.get('status', '')).strip().lower()
+            if 'disqual' in s:
+                return 'Disqualified'
+            if 'open' in s:
+                return 'Open'
+            return 'Other'
+
+        seg_df = filtered.copy()
+        seg_df['segment'] = seg_df.apply(map_segment, axis=1)
+
+        if hp_col:
+            pivot = seg_df.groupby(['_priority_norm', 'segment'])[hp_col].sum().unstack(fill_value=0)
+        else:
+            pivot = seg_df.groupby(['_priority_norm', 'segment']).size().unstack(fill_value=0)
+
+        # Ensure consistent order of priorities and segments
+        for p in ['Urgent', 'Normal']:
+            if p not in pivot.index:
+                pivot.loc[p] = 0
+        for seg in ['Qualified', 'Open', 'Disqualified', 'Other']:
+            if seg not in pivot.columns:
+                pivot[seg] = 0
+        pivot = pivot[['Qualified', 'Open', 'Disqualified', 'Other']].loc[['Urgent', 'Normal']]
+
+        fig2 = go.Figure()
+        colors = {'Qualified':'green', 'Open':'orange', 'Disqualified':'red', 'Other':'lightgray'}
+        # show absolute values with percentages in brackets inside stacked segments
+        # Calculate totals per priority for percentage calculation
+        row_totals = pivot.sum(axis=1)
+        for seg in ['Qualified', 'Open', 'Disqualified', 'Other']:
+            seg_vals = pivot[seg].astype(float).fillna(0)
+            abs_vals = seg_vals.map(lambda v: int(round(v)))
+            # Calculate percentages for each segment relative to its priority row total
+            pct_vals = (seg_vals / row_totals * 100).fillna(0).map(lambda v: f"{v:.1f}%")
+            # Format as: 1,234 (12.3%)
+            text_labels = abs_vals.index.map(lambda idx: f"{abs_vals[idx]:,} ({pct_vals[idx]})") if len(abs_vals) > 0 else []
+            fig2.add_trace(go.Bar(name=seg, x=pivot.index, y=pivot[seg], marker_color=colors.get(seg),
+                                  text=[f"{abs_vals[i]:,} ({pct_vals[i]})" for i in range(len(abs_vals))], 
+                                  textposition='inside'))
+        fig2.update_layout(barmode='stack', title='Qualified / Open / Disqualified by Priority (stacked)', height=420, legend=dict(title='Segment'))
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        # Fallback: no status column — show Qualified vs Other stacked
+        agg['other_leads'] = agg['total_leads'] - agg['qualified_leads']
+        fig2 = go.Figure()
+        q_vals = agg['qualified_leads'].astype(float).fillna(0)
+        o_vals = agg['other_leads'].astype(float).fillna(0)
+        row_total = agg['total_leads'].astype(float).fillna(0)
+        # Calculate percentages
+        q_pct = (q_vals / row_total * 100).fillna(0)
+        o_pct = (o_vals / row_total * 100).fillna(0)
+        # Format labels as: 1,234 (12.3%)
+        q_labels = [f"{int(round(q_vals[i])):,} ({q_pct[i]:.1f}%)" for i in range(len(q_vals))]
+        o_labels = [f"{int(round(o_vals[i])):,} ({o_pct[i]:.1f}%)" for i in range(len(o_vals))]
+        fig2.add_trace(go.Bar(name='Qualified', x=agg.index, y=agg['qualified_leads'], marker_color='green', text=q_labels, textposition='inside'))
+        fig2.add_trace(go.Bar(name='Other', x=agg.index, y=agg['other_leads'], marker_color='lightgray', text=o_labels, textposition='inside'))
+        fig2.update_layout(barmode='stack', title='Qualified vs Other by Priority (stacked)', height=400, legend=dict(title='Segment'))
+        st.plotly_chart(fig2, use_container_width=True)
 
 st.markdown('### Conversion % Over Time')
 if 'yyyymm' in filtered.columns and not filtered.empty:
@@ -200,8 +280,10 @@ if 'yyyymm' in filtered.columns and not filtered.empty:
     fig_ts = go.Figure()
     for pr in ['Urgent','Normal']:
         if pr in pivot.columns:
-            fig_ts.add_trace(go.Scatter(x=pivot['yyyymm'], y=pivot[pr], mode='lines+markers', name=pr))
-    fig_ts.update_layout(title='Conversion % Over Time', xaxis_title='Month (YYYY-MM)', yaxis_title='Conversion %', height=450)
+            # add labels on markers for readability
+            fig_ts.add_trace(go.Scatter(x=pivot['yyyymm'], y=pivot[pr], mode='lines+markers+text', name=pr,
+                                        text=pivot[pr].round(1).map(lambda v: f"{v:.1f}%"), textposition='top center'))
+    fig_ts.update_layout(title='Conversion % Over Time', xaxis_title='Month (YYYY-MM)', yaxis_title='Conversion %', height=480)
     st.plotly_chart(fig_ts, use_container_width=True)
 else:
     st.info('No yyyymm column or no data for time series.')
@@ -209,11 +291,12 @@ else:
 st.markdown('### Average TOV Analysis')
 if 'tov' in filtered.columns and pd.api.types.is_numeric_dtype(filtered['tov']):
     avg_tov_overall = filtered['tov'].mean()
-    st.write(f"Average TOV (overall): {avg_tov_overall:.2f}")
+    st.write(f"Average TOV (overall): {int(round(avg_tov_overall)):,}")
 
     # TOV by priority
     tov_by_pr = filtered.groupby('_priority_norm')['tov'].mean().reindex(['Urgent','Normal']).fillna(0)
-    fig_tov_pr = px.bar(tov_by_pr.reset_index(), x='_priority_norm', y='tov', labels={'_priority_norm':'Priority','tov':'Average TOV'}, text=tov_by_pr.map(lambda v: f"{v:.2f}"))
+    tov_by_pr_display = tov_by_pr.map(lambda v: int(round(v)))
+    fig_tov_pr = px.bar(tov_by_pr.reset_index(), x='_priority_norm', y='tov', labels={'_priority_norm':'Priority','tov':'Average TOV'}, text=tov_by_pr_display.map(lambda v: f"{v:,}"))
     fig_tov_pr.update_layout(title='Average TOV by Priority', height=350)
     st.plotly_chart(fig_tov_pr, use_container_width=True)
 
@@ -224,8 +307,11 @@ if 'tov' in filtered.columns and pd.api.types.is_numeric_dtype(filtered['tov']):
         fig_tov_ts = go.Figure()
         for pr in ['Urgent','Normal']:
             if pr in pivot_tov.columns:
-                fig_tov_ts.add_trace(go.Scatter(x=pivot_tov['yyyymm'], y=pivot_tov[pr], mode='lines+markers', name=pr))
-        fig_tov_ts.update_layout(title='Average TOV Over Time', xaxis_title='Month (YYYY-MM)', yaxis_title='Average TOV', height=400)
+                # show integer monetary-like labels without decimals
+                text_vals = pivot_tov[pr].fillna(0).map(lambda v: f"{int(round(v)):,}")
+                fig_tov_ts.add_trace(go.Scatter(x=pivot_tov['yyyymm'], y=pivot_tov[pr], mode='lines+markers+text', name=pr,
+                                                text=text_vals, textposition='top center'))
+        fig_tov_ts.update_layout(title='Average TOV Over Time', xaxis_title='Month (YYYY-MM)', yaxis_title='Average TOV', height=420)
         st.plotly_chart(fig_tov_ts, use_container_width=True)
 else:
     st.info('TOV column not available or not numeric.')
@@ -240,7 +326,7 @@ st.markdown('---')
 
 # --- Enhanced multi-perspective dashboard (tabs) ---
 st.header('Enhanced: Multi-Perspective Conversion Analysis')
-tab_labels = ['By Market','By Country','By Business Group','By Job Title','Heatmap (Market × Priority)','Summary Table']
+tab_labels = ['By Market','By Country','By Business Group','By Campaign Type','Heatmap (Market × Priority)','Summary Table']
 tabs = st.tabs(tab_labels)
 
 def conversion_by_dim(filtered_df, dim_col, top_n=None):
@@ -269,7 +355,13 @@ with tabs[0]:
                          color_continuous_scale='RdYlGn', labels={'conversion_pct':'Conversion %'})
             fig.update_layout(showlegend=False, height=500)
             st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(by_market.round(2))
+            display_df = by_market.copy()
+            if 'total_leads' in display_df.columns:
+                display_df['total_leads'] = display_df['total_leads'].map(lambda v: f"{int(round(v)):,}")
+            if 'qualified_leads' in display_df.columns:
+                display_df['qualified_leads'] = display_df['qualified_leads'].map(lambda v: f"{int(round(v)):,}")
+            display_df['conversion_pct'] = display_df['conversion_pct'].map(lambda v: f"{v:.1f}%")
+            st.dataframe(display_df)
         else:
             st.info('No market data available.')
     else:
@@ -285,7 +377,13 @@ with tabs[1]:
                          color_continuous_scale='RdYlGn', labels={'conversion_pct':'Conversion %'})
             fig.update_layout(showlegend=False, height=500)
             st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(by_country.head(15).round(2))
+            display_df = by_country.head(15).copy()
+            if 'total_leads' in display_df.columns:
+                display_df['total_leads'] = display_df['total_leads'].map(lambda v: f"{int(round(v)):,}")
+            if 'qualified_leads' in display_df.columns:
+                display_df['qualified_leads'] = display_df['qualified_leads'].map(lambda v: f"{int(round(v)):,}")
+            display_df['conversion_pct'] = display_df['conversion_pct'].map(lambda v: f"{v:.1f}%")
+            st.dataframe(display_df)
         else:
             st.info('No country data available.')
     else:
@@ -301,27 +399,39 @@ with tabs[2]:
                          color_continuous_scale='RdYlGn', labels={'conversion_pct':'Conversion %'})
             fig.update_layout(showlegend=False, height=500)
             st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(by_bg.round(2))
+            display_df = by_bg.copy()
+            if 'total_leads' in display_df.columns:
+                display_df['total_leads'] = display_df['total_leads'].map(lambda v: f"{int(round(v)):,}")
+            if 'qualified_leads' in display_df.columns:
+                display_df['qualified_leads'] = display_df['qualified_leads'].map(lambda v: f"{int(round(v)):,}")
+            display_df['conversion_pct'] = display_df['conversion_pct'].map(lambda v: f"{v:.1f}%")
+            st.dataframe(display_df)
         else:
             st.info('No business group data available.')
     else:
         st.info('Business Group column not available in dataset.')
 
-# Tab 3: By Job Title
+# Tab 3: By Campaign Type (replacing Job Title)
 with tabs[3]:
-    st.subheader('Conversion % by Job Title (Top 15)')
-    if 'job_title' in filtered.columns:
-        by_jt = conversion_by_dim(filtered, 'job_title')
-        if not by_jt.empty:
-            fig = px.bar(by_jt.head(15), x='job_title', y='conversion_pct', color='conversion_pct', text=by_jt.head(15)['conversion_pct'].map(lambda v: f"{v:.1f}%"),
+    st.subheader('Conversion % by Campaign Type (Top 15)')
+    if 'campaign_type' in filtered.columns:
+        by_ct = conversion_by_dim(filtered, 'campaign_type')
+        if not by_ct.empty:
+            fig = px.bar(by_ct.head(15), x='campaign_type', y='conversion_pct', color='conversion_pct', text=by_ct.head(15)['conversion_pct'].map(lambda v: f"{v:.1f}%"),
                          color_continuous_scale='RdYlGn')
             fig.update_layout(showlegend=False, height=500)
             st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(by_jt.head(15).round(2))
+            display_df = by_ct.head(15).copy()
+            if 'total_leads' in display_df.columns:
+                display_df['total_leads'] = display_df['total_leads'].map(lambda v: f"{int(round(v)):,}")
+            if 'qualified_leads' in display_df.columns:
+                display_df['qualified_leads'] = display_df['qualified_leads'].map(lambda v: f"{int(round(v)):,}")
+            display_df['conversion_pct'] = display_df['conversion_pct'].map(lambda v: f"{v:.1f}%")
+            st.dataframe(display_df)
         else:
-            st.info('No job title data available.')
+            st.info('No campaign_type data available.')
     else:
-        st.info('Job Title column not available in dataset.')
+        st.info('Campaign Type column not available in dataset.')
 
 # Tab 4: Heatmap Market x Priority
 with tabs[4]:
@@ -363,12 +473,30 @@ with tabs[5]:
         top_countries = conversion_by_dim(filtered, 'country').head(5)
         bottom_countries = conversion_by_dim(filtered, 'country').tail(5)
         st.markdown('**Top 5 Countries by Conversion %**')
-        st.dataframe(top_countries.round(2))
+        disp_top = top_countries.copy()
+        if 'total_leads' in disp_top.columns:
+            disp_top['total_leads'] = disp_top['total_leads'].map(lambda v: f"{int(round(v)):,}")
+        if 'qualified_leads' in disp_top.columns:
+            disp_top['qualified_leads'] = disp_top['qualified_leads'].map(lambda v: f"{int(round(v)):,}")
+        disp_top['conversion_pct'] = disp_top['conversion_pct'].map(lambda v: f"{v:.1f}%")
+        st.dataframe(disp_top)
         st.markdown('**Bottom 5 Countries by Conversion %**')
-        st.dataframe(bottom_countries.round(2))
+        disp_bottom = bottom_countries.copy()
+        if 'total_leads' in disp_bottom.columns:
+            disp_bottom['total_leads'] = disp_bottom['total_leads'].map(lambda v: f"{int(round(v)):,}")
+        if 'qualified_leads' in disp_bottom.columns:
+            disp_bottom['qualified_leads'] = disp_bottom['qualified_leads'].map(lambda v: f"{int(round(v)):,}")
+        disp_bottom['conversion_pct'] = disp_bottom['conversion_pct'].map(lambda v: f"{v:.1f}%")
+        st.dataframe(disp_bottom)
     if 'business_group' in filtered.columns:
         st.markdown('**Top 5 Business Groups by Conversion %**')
-        st.dataframe(conversion_by_dim(filtered, 'business_group').head(5).round(2))
+        bg_top = conversion_by_dim(filtered, 'business_group').head(5).copy()
+        if 'total_leads' in bg_top.columns:
+            bg_top['total_leads'] = bg_top['total_leads'].map(lambda v: f"{int(round(v)):,}")
+        if 'qualified_leads' in bg_top.columns:
+            bg_top['qualified_leads'] = bg_top['qualified_leads'].map(lambda v: f"{int(round(v)):,}")
+        bg_top['conversion_pct'] = bg_top['conversion_pct'].map(lambda v: f"{v:.1f}%")
+        st.dataframe(bg_top)
 
 st.markdown('---')
 st.caption('Notes: Priority is normalized to Urgent vs Normal. If your dataset has different column names, update code to match them.')
